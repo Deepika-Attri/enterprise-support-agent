@@ -19,3 +19,5 @@ __pycache__/
 
 # data files
 data/documents/
+data/chroma_db/
+data/mock_database.db
