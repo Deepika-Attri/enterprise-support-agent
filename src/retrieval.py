@@ -11,6 +11,45 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from src.config import get_llm, settings
 from src.prompts import GRADER_PROMPT
 
+STOP_WORDS = {
+    "about",
+    "after",
+    "and",
+    "are",
+    "can",
+    "does",
+    "for",
+    "from",
+    "have",
+    "how",
+    "i",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "on",
+    "please",
+    "the",
+    "this",
+    "to",
+    "what",
+    "when",
+    "where",
+    "with",
+    "you",
+    "your",
+}
+
+
+def _keywords(text: str) -> set[str]:
+    """Small, dependency-free lexical signal for obvious policy matches."""
+    return {
+        word.rstrip("s")
+        for word in re.findall(r"[a-z]{3,}", text.lower())
+        if word not in STOP_WORDS
+    }
+
 
 # Free local embeddings, cached so the model loads only once
 @lru_cache(maxsize=1)
@@ -60,9 +99,18 @@ def retrieve(
 def grade_documents(question: str, docs: list[Document]) -> bool:
     if not docs:
         return False  # nothing retrieved means nothing relevant
+    question_terms = _keywords(question)
+    for doc in docs:
+        # Do not let an inconsistent LLM discard an obvious match such as
+        # "How long do refunds take?" against the refund policy.
+        if question_terms & _keywords(doc.page_content):
+            return True
     chain = GRADER_PROMPT | get_llm() | StrOutputParser()
     for doc in docs:
-        verdict = chain.invoke({"question": question, "context": doc.page_content})
+        try:
+            verdict = chain.invoke({"question": question, "context": doc.page_content})
+        except Exception:
+            continue
         # Look at the first few words only, so "Yes.", "**Yes**" and "Yes, it does" all count as yes
         first_words = re.findall(r"[a-z]+", verdict.lower())[:3]
         if "yes" in first_words:

@@ -11,6 +11,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import END, START, StateGraph
 
 from src.config import get_llm, settings
+from src.ingestion import ensure_index
 from src.prompts import ACCOUNT_PROMPT, ANSWER_PROMPT, REWRITER_PROMPT, ROUTER_PROMPT
 from src.retrieval import format_context, format_sources, grade_documents, retrieve
 from src.tools import create_ticket, get_order, init_db
@@ -38,10 +39,43 @@ def ask(prompt, **inputs) -> str:
     return (prompt | get_llm() | StrOutputParser()).invoke(inputs).strip()
 
 
+def _rule_based_route(question: str) -> str | None:
+    """Handle high-confidence support intents before asking a fallible classifier.
+
+    This is deliberately small: the model still handles unusual wording, while the
+    routes that must not fail (an order number, a request for a person, and policy
+    topics) do not depend on model formatting or quality.
+    """
+    text = question.lower()
+    if re.search(r"\bord-\d+\b", text):
+        return "account"
+    if re.search(
+        r"\b(human|agent|representative|manager|supervisor|legal|lawyer|sue|lawsuit)\b",
+        text,
+    ):
+        return "escalate"
+    if re.search(
+        r"\b(refund|return|exchange|shipping|delivery|damaged|replacement|"
+        r"leave|holiday|vacation|benefit|policy|discount)\w*\b",
+        text,
+    ):
+        return "knowledge"
+    return None
+
+
 # ---------- Nodes: each returns only the fields it changes ----------
 def router_node(state: AgentState) -> dict:
     """Classify the question into knowledge / account / escalate / out_of_scope."""
-    raw = ask(ROUTER_PROMPT, question=state["question"]).lower()
+    rule_route = _rule_based_route(state["question"])
+    if rule_route:
+        return {"route": rule_route}
+
+    try:
+        raw = ask(ROUTER_PROMPT, question=state["question"]).lower()
+    except Exception:
+        # A support question is the least surprising safe fallback; retrieval can
+        # still provide a grounded answer or create a ticket when it cannot.
+        return {"route": "knowledge"}
     valid = ["account", "escalate", "out_of_scope", "knowledge"]
     return {"route": next((r for r in valid if r in raw), "knowledge")}  # safe fallback
 
@@ -69,12 +103,59 @@ def rewrite_node(state: AgentState) -> dict:
     return {"search_query": new_query, "retries": state.get("retries", 0) + 1}
 
 
+def extractive_answer(question: str, docs: list[Document]) -> str:
+    """Return a readable, grounded fallback when answer generation is unavailable."""
+    question_words = {
+        word.rstrip("s")
+        for word in re.findall(r"[a-z]{3,}", question.lower())
+        if word
+        not in {
+            "about",
+            "after",
+            "does",
+            "from",
+            "have",
+            "how",
+            "long",
+            "that",
+            "the",
+            "this",
+            "what",
+            "when",
+            "with",
+            "would",
+            "your",
+        }
+    }
+    candidates: list[tuple[int, str, str]] = []
+    for doc in docs:
+        source = doc.metadata.get("source", "available documents")
+        for sentence in re.split(r"(?<=[.!?])\s+", doc.page_content.strip()):
+            words = {
+                word.rstrip("s") for word in re.findall(r"[a-z]{3,}", sentence.lower())
+            }
+            candidates.append((len(question_words & words), sentence.strip(), source))
+
+    if not candidates:
+        return "I couldn't find an answer in the available documents."
+    _, sentence, source = max(candidates, key=lambda item: item[0])
+    return f"Based on the available policy: {sentence} [{source}]"
+
+
 def generate_node(state: AgentState) -> dict:
     """Write the final cited answer from the approved chunks."""
     docs = state["documents"]
-    answer = ask(
-        ANSWER_PROMPT, context=format_context(docs), question=state["question"]
-    )
+    try:
+        answer = ask(
+            ANSWER_PROMPT, context=format_context(docs), question=state["question"]
+        )
+    except Exception:
+        # A retrieved policy is more useful than an error page if the configured
+        # model is temporarily unavailable. The source list still makes this
+        # response auditable.
+        answer = ""
+    if not answer or answer.lower().startswith("i don't know based on"):
+        answer = extractive_answer(state["question"], docs)
     return {"answer": answer, "sources": format_sources(docs)}
 
 
@@ -183,6 +264,7 @@ def run_agent(
 ) -> dict:
     """Run the agent; returns the answer plus contexts and the node path (RAGAS-ready)."""
     init_db()
+    ensure_index()  # make the CLI/API usable without first opening Streamlit
     state = {
         "question": question,
         "department": department,
@@ -212,6 +294,7 @@ def baseline_rag(
     question: str, department: str | None = None, include_samples: bool = True
 ) -> dict:
     """Plain retrieve -> answer pipeline with no agent logic; the Phase 2 RAGAS baseline."""
+    ensure_index()
     docs = retrieve(question, department, include_samples=include_samples)
     answer = ask(ANSWER_PROMPT, context=format_context(docs), question=question)
     return {

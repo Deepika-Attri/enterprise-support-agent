@@ -39,6 +39,7 @@ enterprise-support-agent/
 ├── .gitignore
 ├── README.md
 ├── requirements.txt
+├── pytest.ini                # tells pytest how to run/configure tests
 │
 ├── src/
 │   ├── config.py
