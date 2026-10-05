@@ -104,6 +104,7 @@ def rewrite_node(state: AgentState) -> dict:
 
 
 def extractive_answer(question: str, docs: list[Document]) -> str:
+def fallback_answer(docs: list[Document]) -> str:
     """Return a readable, grounded fallback when answer generation is unavailable."""
     question_words = {
         word.rstrip("s")
@@ -132,14 +133,19 @@ def extractive_answer(question: str, docs: list[Document]) -> str:
         source = doc.metadata.get("source", "available documents")
         for sentence in re.split(r"(?<=[.!?])\s+", doc.page_content.strip()):
             words = {
-                word.rstrip("s") for word in re.findall(r"[a-z]{3,}", sentence.lower())
+                word.rstrip("s")
+                for word in re.findall(r"[a-z]{3,}", sentence.lower())
             }
             candidates.append((len(question_words & words), sentence.strip(), source))
 
     if not candidates:
+    if not docs:
         return "I couldn't find an answer in the available documents."
     _, sentence, source = max(candidates, key=lambda item: item[0])
     return f"Based on the available policy: {sentence} [{source}]"
+    doc = docs[0]
+    source = doc.metadata.get("source", "available documents")
+    return f"Based on the available policy: {doc.page_content.strip()} [{source}]"
 
 
 def generate_node(state: AgentState) -> dict:
@@ -156,6 +162,7 @@ def generate_node(state: AgentState) -> dict:
         answer = ""
     if not answer or answer.lower().startswith("i don't know based on"):
         answer = extractive_answer(state["question"], docs)
+        answer = fallback_answer(docs)
     return {"answer": answer, "sources": format_sources(docs)}
 
 
@@ -203,12 +210,25 @@ def out_of_scope_node(state: AgentState) -> dict:
     }
 
 
+def no_answer_node(state: AgentState) -> dict:
+    """End a failed knowledge search without opening an unnecessary ticket."""
+    return {
+        "answer": (
+            "I couldn't find an answer to that in the available documents. "
+            "Please try rephrasing your question or add a relevant policy document."
+        ),
+        "sources": [],
+    }
+
+
 # ---------- Decisions: conditional edges ----------
 def route_after_grade(state: AgentState) -> str:
     """Good context -> answer. Weak -> rewrite. Retries used up -> escalate."""
+    """Good context -> answer. Weak -> rewrite. Exhausted search -> no-answer."""
     if state["relevant"]:
         return "generate"
     return "rewrite" if state.get("retries", 0) < settings.MAX_RETRIES else "escalate"
+    return "rewrite" if state.get("retries", 0) < settings.MAX_RETRIES else "no_answer"
 
 
 # ---------- Graph assembly ----------
@@ -226,6 +246,7 @@ def build_graph():
         "account": account_node,
         "escalate": escalate_node,
         "out_of_scope": out_of_scope_node,
+        "no_answer": no_answer_node,
     }.items():
         g.add_node(name, fn)
 
@@ -248,11 +269,13 @@ def build_graph():
             "generate": "generate",
             "rewrite": "rewrite",
             "escalate": "escalate",
+            "no_answer": "no_answer",
         },
     )
     g.add_edge("rewrite", "retrieve")  # the self-correction loop
 
     for terminal in ("generate", "account", "escalate", "out_of_scope"):
+    for terminal in ("generate", "account", "escalate", "out_of_scope", "no_answer"):
         g.add_edge(terminal, END)
 
     return g.compile()
