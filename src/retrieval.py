@@ -1,5 +1,6 @@
 """Retrieval: ChromaDB search, metadata filtering, relevance grading and citations."""
 
+import logging
 import re
 from functools import lru_cache
 
@@ -10,6 +11,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from src.config import get_llm, settings
 from src.prompts import GRADER_PROMPT
+
+logger = logging.getLogger(__name__)
 
 STOP_WORDS = {
     "about",
@@ -110,7 +113,9 @@ def grade_documents(question: str, docs: list[Document]) -> bool:
         try:
             verdict = chain.invoke({"question": question, "context": doc.page_content})
         except Exception:
-            continue
+            logger.exception("Document relevance grading failed")
+            verdict = ""
+            # continue
         # Look at the first few words only, so "Yes.", "**Yes**" and "Yes, it does" all count as yes
         first_words = re.findall(r"[a-z]+", verdict.lower())[:3]
         if "yes" in first_words:
